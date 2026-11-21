@@ -1,0 +1,129 @@
+import subprocess
+import sys
+
+# ---------- Auto-install (first run only) ----------
+needed = {
+    "gradio": "gradio",
+    "transformers": "transformers",
+    "torch": "torch",
+    "PIL": "pillow",
+    "accelerate": "accelerate",
+}
+for module, pkg in needed.items():
+    try:
+        __import__(module)
+    except ImportError:
+        print(f"Installing {pkg}, please wait...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", pkg, "--no-warn-script-location"]
+        )
+
+import gradio as gr
+import torch
+from PIL import Image
+from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+
+# ---------- Customize your AI here ----------
+BOT_NAME = "Cliff" 
+SYSTEM_PROMPT = (
+    f"You are {BOT_NAME}, a friendly, funny, and helpful AI assistant. "
+    "You can look at photos the user sends. "
+    "You can mix English and Tagalog if the user does. Keep replies short and clear."
+)
+MODEL = "Qwen/Qwen2-VL-2B-Instruct"  # reads photos AND text (about 4-5 GB)
+# --------------------------------------------
+
+print("Loading model (the first run downloads a few GB)...")
+model = Qwen2VLForConditionalGeneration.from_pretrained(MODEL, torch_dtype="auto")
+# Small image size keeps replies faster on a normal laptop
+processor = AutoProcessor.from_pretrained(
+    MODEL, min_pixels=64 * 28 * 28, max_pixels=256 * 28 * 28
+)
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+
+
+def find_images(content):
+    """Find image file paths inside a chat message (handles different formats)."""
+    found = []
+    if isinstance(content, str):
+        if content.lower().endswith(IMAGE_EXTS):
+            found.append(content)
+    elif isinstance(content, (list, tuple)):
+        for item in content:
+            found.extend(find_images(item))
+    elif isinstance(content, dict):
+        path = content.get("path")
+        if not path and isinstance(content.get("file"), dict):
+            path = content["file"].get("path")
+        if path:
+            found.extend(find_images(path))
+    return found
+
+
+def get_text(content):
+    if isinstance(content, str):
+        return "" if content.lower().endswith(IMAGE_EXTS) else content
+    if isinstance(content, dict):
+        return content.get("text", "") or ""
+    if isinstance(content, (list, tuple)):
+        return " ".join(get_text(c) for c in content)
+    return ""
+
+
+def chat(message, history):
+    text = message.get("text", "") or ""
+    new_images = []
+    for f in message.get("files", []) or []:
+        new_images.extend(find_images(f))
+
+    messages = [{"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}]
+    last_image = None
+
+    for turn in history:
+        content = turn["content"]
+        imgs = find_images(content)
+        if imgs:
+            last_image = imgs[-1]
+        t = get_text(content).strip()
+        if t:
+            messages.append({"role": turn["role"], "content": [{"type": "text", "text": t}]})
+
+    # Use the new photo, or remember the last one sent earlier in the chat
+    image_path = new_images[-1] if new_images else last_image
+    user_content = []
+    if new_images:
+        user_content.append({"type": "image"})
+    user_content.append({"type": "text", "text": text or "Describe this image."})
+    messages.append({"role": "user", "content": user_content})
+
+    # If the photo was sent earlier, attach it to the first user message instead
+    images = None
+    if new_images:
+        images = [Image.open(new_images[-1]).convert("RGB")]
+    elif image_path:
+        for m in messages:
+            if m["role"] == "user":
+                m["content"].insert(0, {"type": "image"})
+                break
+        images = [Image.open(image_path).convert("RGB")]
+
+    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+    inputs = processor(text=[prompt], images=images, padding=True, return_tensors="pt")
+
+    with torch.no_grad():
+        output = model.generate(
+            **inputs, max_new_tokens=300, do_sample=True, temperature=0.7
+        )
+    output = output[:, inputs["input_ids"].shape[1]:]
+    return processor.batch_decode(output, skip_special_tokens=True)[0]
+
+
+demo = gr.ChatInterface(
+    chat,
+    multimodal=True,
+    title=BOT_NAME,
+    description="Chat with my own AI! You can send photos too.",
+)
+
+demo.launch(share=False)
